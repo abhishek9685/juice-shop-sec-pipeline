@@ -1,0 +1,132 @@
+name: devsecops
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"      # weekly: catch newly published CVEs in unchanged code
+  workflow_dispatch:           # allow manual runs from the Actions tab
+
+# Least privilege by default; each job asks only for what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- SAST
+  semgrep:
+    name: semgrep (SAST)
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep:latest
+    permissions:
+      contents: read
+      security-events: write   # required to upload SARIF to Code scanning
+    steps:
+      - uses: actions/checkout@v4
+
+      # ERROR is Semgrep's top severity (treated as "high").
+      # --error makes the command exit 1 when findings remain -> job fails.
+      - name: Semgrep scan
+        run: >
+          semgrep scan
+          --config p/default --config p/nodejs --config p/owasp-top-ten
+          --severity ERROR --error
+          --sarif --output semgrep.sarif
+
+      # always(): upload results even if the scan step failed.
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep      # unique per tool, or uploads overwrite each other
+
+  # ------------------------------------------- SCA + secrets + IaC (source)
+  trivy-fs:
+    name: trivy (deps, secrets, IaC)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true               # only report what can actually be fixed
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "1"                     # fail the job on HIGH/CRITICAL
+          limit-severities-for-sarif: true   # keep LOW/MEDIUM out of the SARIF too
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # ------------------------------------------------------ container image
+  trivy-image:
+    name: trivy (container image)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t juice-shop:${{ github.sha }} .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: juice-shop:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "1"
+          limit-severities-for-sarif: true
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # ------------------------------------------------------------------ SBOM
+  sbom:
+    name: sbom (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
